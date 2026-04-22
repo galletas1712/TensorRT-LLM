@@ -45,6 +45,7 @@
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cstdint>
 #include <nanobind/stl/vector.h>
 
 #include <nanobind/nanobind.h>
@@ -97,6 +98,78 @@ public:
         NB_OVERRIDE_PURE(disableLookahead, samplingConfig, batchSize, batchSlots);
     }
 };
+
+namespace
+{
+
+class PyVirtualMemoryCallbacks
+{
+public:
+    PyVirtualMemoryCallbacks(nb::callable createFn, nb::callable releaseFn)
+        : mCreateFn(std::move(createFn))
+        , mReleaseFn(std::move(releaseFn))
+    {
+    }
+
+    ~PyVirtualMemoryCallbacks()
+    {
+        if (!Py_IsInitialized())
+        {
+            return;
+        }
+        nb::gil_scoped_acquire acquire;
+        mCreateFn = nb::callable();
+        mReleaseFn = nb::callable();
+    }
+
+    nb::callable const& createFn() const
+    {
+        return mCreateFn;
+    }
+
+    nb::callable const& releaseFn() const
+    {
+        return mReleaseFn;
+    }
+
+private:
+    nb::callable mCreateFn;
+    nb::callable mReleaseFn;
+};
+
+class PyVirtualMemoryCreator : public tr::CUDAVirtualMemoryChunk::Creator
+{
+public:
+    PyVirtualMemoryCreator(std::shared_ptr<PyVirtualMemoryCallbacks> callbacks, std::size_t size, int device,
+        std::shared_ptr<tr::CudaStream> backStream)
+        : mCallbacks(std::move(callbacks))
+        , mSize(size)
+        , mDevice(device)
+        , mStream(backStream ? reinterpret_cast<uintptr_t>(backStream->get()) : 0)
+    {
+    }
+
+    CUmemGenericAllocationHandle create() override
+    {
+        nb::gil_scoped_acquire acquire;
+        return static_cast<CUmemGenericAllocationHandle>(
+            nb::cast<uint64_t>(mCallbacks->createFn()(mSize, mDevice, mStream)));
+    }
+
+    void release(CUmemGenericAllocationHandle handle, bool destructing) override
+    {
+        nb::gil_scoped_acquire acquire;
+        mCallbacks->releaseFn()(static_cast<uint64_t>(handle), mSize, mDevice, mStream, destructing);
+    }
+
+private:
+    std::shared_ptr<PyVirtualMemoryCallbacks> mCallbacks;
+    std::size_t mSize;
+    int mDevice;
+    uintptr_t mStream;
+};
+
+} // namespace
 
 namespace tensorrt_llm::nanobind::runtime
 {
@@ -355,6 +428,24 @@ void initBindings(nb::module_& m)
 
     m.def("pop_virtual_memory_allocator", &tr::popVirtualMemoryAllocator,
         "Pop the top virtual memory allocator from the allocator stack", nb::call_guard<nb::gil_scoped_release>());
+
+    m.def(
+        "register_virtual_memory_creator",
+        [](std::string const& tag, nb::callable createFn, nb::callable releaseFn)
+        {
+            auto callbacks = std::make_shared<PyVirtualMemoryCallbacks>(std::move(createFn), std::move(releaseFn));
+            tr::registerVirtualMemoryCreatorFactory(tag,
+                [callbacks = std::move(callbacks)](
+                    std::size_t size, int device, std::shared_ptr<tr::CudaStream> backStream)
+                {
+                    return std::make_unique<PyVirtualMemoryCreator>(callbacks, size, device, std::move(backStream));
+                });
+        },
+        nb::arg("tag"), nb::arg("create_fn"), nb::arg("release_fn"),
+        "Register a custom virtual-memory creator for a tag.");
+
+    m.def("unregister_virtual_memory_creator", &tr::unregisterVirtualMemoryCreatorFactory, nb::arg("tag"),
+        "Unregister the custom virtual-memory creator for a tag.");
 
     nb::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
         .def(nb::init<size_t, uint32_t, uint32_t, uint32_t, bool, int64_t>(), nb::arg("buf_size"),

@@ -1,7 +1,8 @@
+import atexit
 import contextlib
 import functools
 from contextlib import contextmanager
-from typing import Generator
+from typing import Callable, Generator
 
 import torch
 
@@ -9,12 +10,17 @@ from tensorrt_llm.bindings.internal.runtime import \
     CudaVirtualMemoryAllocatorRestoreMode as RestoreMode
 from tensorrt_llm.bindings.internal.runtime import (
     get_virtual_memory_manager, pop_virtual_memory_allocator,
-    push_virtual_memory_allocator)
+    push_virtual_memory_allocator, register_virtual_memory_creator as
+    _register_virtual_memory_creator, unregister_virtual_memory_creator as
+    _unregister_virtual_memory_creator)
 
 __all__ = [
     "RestoreMode", "maybe_scope", "scope", "release_with_tag",
-    "materialize_with_tag"
+    "materialize_with_tag", "register_virtual_memory_creator",
+    "unregister_virtual_memory_creator"
 ]
+
+_registered_creator_tags: set[str] = set()
 
 
 @functools.cache
@@ -137,3 +143,25 @@ def materialize_with_tag(*tags: str) -> int:
     manager = get_virtual_memory_manager()
     materialized_blobs = sum(manager.materialize_with_tag(tag) for tag in tags)
     return materialized_blobs
+
+
+def register_virtual_memory_creator(
+    tag: str,
+    create_fn: Callable[[int, int, int], int],
+    release_fn: Callable[[int, int, int, int, bool], None],
+) -> None:
+    _register_virtual_memory_creator(tag, create_fn, release_fn)
+    _registered_creator_tags.add(tag)
+
+
+def unregister_virtual_memory_creator(tag: str) -> bool:
+    _registered_creator_tags.discard(tag)
+    return _unregister_virtual_memory_creator(tag)
+
+
+def _clear_registered_virtual_memory_creators() -> None:
+    for tag in list(_registered_creator_tags):
+        unregister_virtual_memory_creator(tag)
+
+
+atexit.register(_clear_registered_virtual_memory_creators)

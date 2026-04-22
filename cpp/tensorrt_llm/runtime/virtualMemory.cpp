@@ -18,6 +18,7 @@
 #include "bufferManager.h"
 
 #include <forward_list>
+#include <unordered_map>
 #include <shared_mutex>
 
 namespace tensorrt_llm::runtime
@@ -25,6 +26,11 @@ namespace tensorrt_llm::runtime
 
 namespace
 {
+
+using VirtualMemoryCreatorFactory = tensorrt_llm::runtime::VirtualMemoryCreatorFactory;
+
+std::shared_mutex sCreatorFactoryMutex;
+std::unordered_map<std::string, VirtualMemoryCreatorFactory> sCreatorFactories;
 
 template <typename T>
 struct ScopeGuard
@@ -43,6 +49,28 @@ struct ScopeGuard
 
 template <typename T>
 ScopeGuard(bool const&, T) -> ScopeGuard<T>;
+
+VirtualMemoryCreatorFactory getCreatorFactory(std::string const& tag)
+{
+    std::shared_lock lock(sCreatorFactoryMutex);
+    auto const it = sCreatorFactories.find(tag);
+    if (it == sCreatorFactories.end())
+    {
+        return {};
+    }
+    return it->second;
+}
+
+CUDAVirtualMemoryChunk::CreatorPtr createRegisteredCreator(
+    std::string const& tag, std::size_t size, int device, std::shared_ptr<CudaStream> const& backStream)
+{
+    auto factory = getCreatorFactory(tag);
+    if (!factory)
+    {
+        return {};
+    }
+    return factory(size, device, backStream);
+}
 
 } // namespace
 
@@ -366,14 +394,19 @@ void CudaVirtualMemoryAllocator::allocate(Pointer* ptr, std::size_t n, int devic
         break;
     }
 
-    mConfig->mManager.add(address, mConfig->mTag,
-        std::make_unique<LocalCreator<>>(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
-                                             {
-                                                 CU_MEM_LOCATION_TYPE_DEVICE,
-                                                 device,
-                                             }},
-            alignedSize),
-        std::move(configurators));
+    auto creator = createRegisteredCreator(mConfig->mTag, alignedSize, device, mConfig->mBackStream);
+    if (!creator)
+    {
+        creator = std::make_unique<LocalCreator<>>(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED,
+                                                      CU_MEM_HANDLE_TYPE_NONE,
+                                                      {
+                                                          CU_MEM_LOCATION_TYPE_DEVICE,
+                                                          device,
+                                                      }},
+            alignedSize);
+    }
+
+    mConfig->mManager.add(address, mConfig->mTag, std::move(creator), std::move(configurators));
 
     *ptr = deviceptr_cast(address);
 }
@@ -410,6 +443,19 @@ CudaVirtualMemoryAllocator getVirtualMemoryAllocator()
 {
     std::shared_lock lock(sConfMutex);
     return CudaVirtualMemoryAllocator{sCurrentConf};
+}
+
+void registerVirtualMemoryCreatorFactory(std::string tag, VirtualMemoryCreatorFactory factory)
+{
+    TLLM_CHECK_WITH_INFO(static_cast<bool>(factory), "registerVirtualMemoryCreatorFactory received empty factory");
+    std::unique_lock lock(sCreatorFactoryMutex);
+    sCreatorFactories.insert_or_assign(std::move(tag), std::move(factory));
+}
+
+bool unregisterVirtualMemoryCreatorFactory(std::string const& tag)
+{
+    std::unique_lock lock(sCreatorFactoryMutex);
+    return sCreatorFactories.erase(tag) != 0;
 }
 
 void pushVirtualMemoryAllocator(

@@ -196,6 +196,74 @@ TEST_F(VirtualMemoryTest, TestBasic)
     }
 }
 
+TEST_F(VirtualMemoryTest, TestRegisteredCreatorFactory)
+{
+    class CountingCreator : public CUDAVirtualMemoryChunk::Creator
+    {
+    public:
+        CountingCreator(std::size_t size, int device, std::shared_ptr<int> createCount, std::shared_ptr<int> releaseCount)
+            : mInner(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
+                         {
+                             CU_MEM_LOCATION_TYPE_DEVICE,
+                             device,
+                         }},
+                size)
+            , mCreateCount(std::move(createCount))
+            , mReleaseCount(std::move(releaseCount))
+        {
+        }
+
+        CUmemGenericAllocationHandle create() override
+        {
+            ++*mCreateCount;
+            return mInner.create();
+        }
+
+        void release(CUmemGenericAllocationHandle handle, bool destructing) override
+        {
+            ++*mReleaseCount;
+            mInner.release(handle, destructing);
+        }
+
+    private:
+        LocalCreator<> mInner;
+        std::shared_ptr<int> mCreateCount;
+        std::shared_ptr<int> mReleaseCount;
+    };
+
+    auto createCount = std::make_shared<int>(0);
+    auto releaseCount = std::make_shared<int>(0);
+    auto const tag = std::string{"test_registered_creator_factory"};
+
+    registerVirtualMemoryCreatorFactory(tag,
+        [createCount, releaseCount](std::size_t size, int device, std::shared_ptr<CudaStream> backStream)
+        {
+            (void) backStream;
+            return std::make_unique<CountingCreator>(size, device, createCount, releaseCount);
+        });
+    struct Cleanup
+    {
+        std::string tag;
+
+        ~Cleanup()
+        {
+            unregisterVirtualMemoryCreatorFactory(tag);
+        }
+    } cleanup{tag};
+
+    auto allocator = CudaVirtualMemoryAllocator(std::make_shared<CudaVirtualMemoryAllocator::Configuration>(
+        getVirtualMemoryManager(), tag, CudaVirtualMemoryAllocator::RestoreMode::NONE, std::make_shared<CudaStream>()));
+
+    void* ptr{};
+    allocator.allocate(&ptr, 4096, 0);
+    ASSERT_EQ(*createCount, 1);
+    ASSERT_EQ(cudaMemset(ptr, 0, 4096), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    allocator.deallocate(ptr, 4096);
+    ASSERT_EQ(*releaseCount, 1);
+}
+
 // Test BackedConfigurator refills memory correctly for both CPU and PINNED memory types
 class VirtualMemoryOffloadConfigurator : public VirtualMemoryTest, public ::testing::WithParamInterface<MemoryType>
 {

@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <cuda.h>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -560,12 +561,17 @@ private:
     std::shared_ptr<Configuration> mConfig;
 };
 
+using VirtualMemoryCreatorFactory = std::function<CUDAVirtualMemoryChunk::CreatorPtr(
+    std::size_t size, int device, std::shared_ptr<CudaStream> backStream)>;
+
 } // namespace tensorrt_llm::runtime
 
 namespace tensorrt_llm::runtime
 {
 CudaVirtualMemoryManager& getVirtualMemoryManager();
 CudaVirtualMemoryAllocator getVirtualMemoryAllocator();
+void registerVirtualMemoryCreatorFactory(std::string tag, VirtualMemoryCreatorFactory factory);
+bool unregisterVirtualMemoryCreatorFactory(std::string const& tag);
 void pushVirtualMemoryAllocator(
     std::string const& tag, CudaVirtualMemoryAllocator::RestoreMode mode, std::shared_ptr<CudaStream> backStream);
 void popVirtualMemoryAllocator();
