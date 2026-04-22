@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import json
 import os
 import tempfile
@@ -27,6 +28,67 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 
+_RECOVERABLE_LOCK_ERRNOS = {errno.ENOLCK, errno.ESTALE}
+
+
+def _is_recoverable_lock_oserror(exception: BaseException) -> bool:
+    return isinstance(exception, OSError) and exception.errno in _RECOVERABLE_LOCK_ERRNOS
+
+
+def _clear_filelock_state_after_release_error(lock: Any, fd: Optional[int]) -> None:
+    if fd is not None:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+    context = getattr(lock, "_context", None)
+    if context is not None:
+        context.lock_file_fd = None
+        context.lock_counter = 0
+
+    with contextlib.suppress(Exception):
+        from filelock._api import _canonical, _registry
+
+        _registry.held.pop(_canonical(lock.lock_file), None)
+
+
+def _try_acquire_config_lock(lock_path: Path, timeout: int,
+                             lock_name: str) -> Optional[Any]:
+    lock = filelock.FileLock(str(lock_path), timeout=timeout)
+
+    try:
+        lock.acquire()
+        return lock
+    except filelock.Timeout:
+        logger.warning(
+            f"failed to acquire {lock_name} config lock within {timeout} seconds"
+        )
+    except PermissionError as e:
+        logger.warning(
+            f"{lock_name} config lock unavailable due to OS/permission issue: {e}"
+        )
+    except OSError as e:
+        if not _is_recoverable_lock_oserror(e):
+            raise
+        logger.warning(
+            f"{lock_name} config lock unavailable due to OS/lock issue: {e}"
+        )
+
+    return None
+
+
+def _release_config_lock(lock: Any, lock_name: str) -> None:
+    fd = getattr(getattr(lock, "_context", None), "lock_file_fd", None)
+
+    try:
+        lock.release()
+    except OSError as e:
+        if not _is_recoverable_lock_oserror(e):
+            raise
+        logger.warning(
+            f"{lock_name} config lock release failed due to OS/lock issue: {e}, continuing"
+        )
+        _clear_filelock_state_after_release_error(lock, fd)
+
 
 @contextlib.contextmanager
 def config_file_lock(timeout: int = 10):
@@ -43,33 +105,21 @@ def config_file_lock(timeout: int = 10):
     # This serializes all model loading operations to prevent race conditions
     lock_path = Path(HF_MODULES_CACHE) / "_remote_code.lock"
 
-    # Create and acquire the lock
-    lock = filelock.FileLock(str(lock_path), timeout=timeout)
-
-    try:
-        with lock:
-            yield
-    except (PermissionError, filelock.Timeout):
-        # Fallback to tempdir
+    lock = _try_acquire_config_lock(lock_path, timeout, "HF cache")
+    if lock is None:
         tmp_dir = Path(tempfile.gettempdir())
         tmp_dir.mkdir(parents=True, exist_ok=True)
         tmp_lock_path = tmp_dir / "_remote_code.lock"
-        tmp_lock = filelock.FileLock(str(tmp_lock_path), timeout=timeout)
-        try:
-            with tmp_lock:
-                yield
-        except filelock.Timeout:
-            logger.warning(
-                f"failed to acquire tempdir config lock within {timeout} seconds, proceeding without lock"
-            )
-            # proceed without lock
-            yield
-        except (PermissionError) as e:
-            logger.warning(
-                f"tempdir config lock unavailable due to OS/permission issue: {e}, proceeding without lock"
-            )
-            # proceed without lock
-            yield
+        lock = _try_acquire_config_lock(tmp_lock_path, timeout, "tempdir")
+
+    if lock is None:
+        logger.warning("all config locks unavailable, proceeding without lock")
+
+    try:
+        yield
+    finally:
+        if lock is not None:
+            _release_config_lock(lock, lock.lock_file)
 
 
 @dataclass(kw_only=True)

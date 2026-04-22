@@ -1,9 +1,11 @@
+import errno
 import types
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.model_config import ModelConfig
+import tensorrt_llm._torch.model_config as model_config_module
+from tensorrt_llm._torch.model_config import ModelConfig, config_file_lock
 from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_kv_cache_quant
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -116,3 +118,62 @@ def test_validate_and_set_kv_cache_quant_rejects_invalid_dtype():
     model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
     with pytest.raises(ValueError, match="Accepted types are"):
         validate_and_set_kv_cache_quant(model_config, "invalid_dtype")
+
+
+def test_config_file_lock_falls_back_to_tempdir_on_estale(monkeypatch):
+    locks = []
+
+    class FakeLock:
+        def __init__(self, path, timeout):
+            self.lock_file = path
+            self.timeout = timeout
+            self._context = types.SimpleNamespace(lock_file_fd=None, lock_counter=0)
+            locks.append(self)
+
+        def acquire(self):
+            if len(locks) == 1:
+                raise OSError(errno.ESTALE, "Stale file handle")
+            self._context.lock_file_fd = 11
+            self._context.lock_counter = 1
+
+        def release(self):
+            self._context.lock_file_fd = None
+            self._context.lock_counter = 0
+
+    monkeypatch.setattr(model_config_module.filelock, "FileLock", FakeLock)
+
+    with config_file_lock():
+        pass
+
+    assert len(locks) == 2
+    assert locks[1]._context.lock_counter == 0
+
+
+def test_config_file_lock_suppresses_enolck_on_release(monkeypatch):
+    locks = []
+    closed_fds = []
+
+    class FakeLock:
+        def __init__(self, path, timeout):
+            self.lock_file = path
+            self.timeout = timeout
+            self._context = types.SimpleNamespace(lock_file_fd=None, lock_counter=0)
+            locks.append(self)
+
+        def acquire(self):
+            self._context.lock_file_fd = 17
+            self._context.lock_counter = 1
+
+        def release(self):
+            self._context.lock_file_fd = None
+            raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(model_config_module.filelock, "FileLock", FakeLock)
+    monkeypatch.setattr(model_config_module.os, "close", closed_fds.append)
+
+    with config_file_lock():
+        pass
+
+    assert len(locks) == 1
+    assert closed_fds == [17]
+    assert locks[0]._context.lock_counter == 0
